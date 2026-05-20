@@ -1,0 +1,23 @@
+{
+  "skill_name": "tilelang-npu-quant-adapt",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "请把 TileKernels 里的 per_block_cast_lossless_kernel.py 适配到 tilelang-ascend examples/quant 下。当前只支持 bf16 输入、fp32 输出，需要对齐 GPU 入参、测试参数生成和 scale factor 语义，本地没有 NPU 环境，不要运行命令。",
+      "expected_output": "应先读取 GPU quant common、torch cast_back reference 和 GPU test，明确 NPU dtype/fmt 限制，使用 common.py 组织 config/SF helper，采用 padding+crop，并说明不运行验证。",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "这个 quant cast 算子在 NPU 上 packed_ue8m0 + tma_aligned_col_major_sf 的 case shape 不对，报 The size of tensor a (4001) must match b (5)。帮我检查 common.py 的 scale factor layout/ref 逻辑。",
+      "expected_output": "应重点检查 get_sf_shape、int32 view uint8、num_sf_k_packed、外部/TMA layout 与内部 layout 区分，并建议 cast_back_ref 默认按外部 SF 布局处理。",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "我想把 examples/quant 下多个 NPU quant 算子复用的 CastInputConfig、CastOutputConfig、get_sf_shape、cast_back_ref 抽到 common.py，并像 GPU 一样 from common import *，帮我整理。",
+      "expected_output": "应建议 common.py 维护 __all__，算子文件使用 relative/direct import fallback，把通用 config/SF/ref helper 放 common，算子特定 layout/kernel 保留在具体文件。",
+      "files": []
+    }
+  ]
+}
