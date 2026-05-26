@@ -210,9 +210,14 @@ def get_cast_output_config(
     use_packed_ue8m0: bool = False,
     custom_clamp_min_value: Optional[float] = None,
 ) -> CastOutputConfig:
-    assert fmt in ("fp32", "float32")
+    assert fmt in ("fp32", "float32", "e5m6")
+    mapping = {
+        "fp32": torch.float32,
+        "float32": torch.float32,
+        "e5m6": torch.uint32,  # kernel outputs packed e5m6 as uint32
+    }
     return CastOutputConfig(
-        torch_dtype=torch.float32,
+        torch_dtype=mapping[fmt],
         sf_block=sf_block,
         use_tma_aligned_col_major_sf=use_tma_aligned_col_major_sf,
         round_sf=round_sf,
