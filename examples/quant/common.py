@@ -2,6 +2,7 @@ from dataclasses import dataclass, replace
 from typing import Optional
 
 import torch
+import tilelang.language as T
 
 __all__ = [
     "BaseCastConfig",
@@ -19,6 +20,7 @@ __all__ = [
     "get_cast_output_config",
     "load_sf",
     "store_sf",
+    "transform_sf",
     "sf_to_exponent_value",
     "exponent_to_sf_value",
     "transform_sf_for_ref",
@@ -67,6 +69,8 @@ class CastOutputConfig(BaseCastConfig):
             return torch.finfo(torch.float32).tiny
         if self.dtype == "bfloat16":
             return torch.finfo(torch.bfloat16).tiny
+        if self.dtype == "int8":
+            return 6.0 * 2 ** (-126)
         raise ValueError(f"Unsupported dtype {self.dtype}")
 
 
@@ -171,7 +175,7 @@ def get_cast_input_and_config(
     if isinstance(x, tuple):
         x_data, x_sf = x
         config = CastInputConfig(torch_dtype=x_data.dtype, sf_block=sf_block, with_sf=True)
-        assert x_data.dtype == torch.bfloat16
+        assert x_data.dtype in (torch.bfloat16, torch.float32)
         assert isinstance(x_sf, torch.Tensor)
         if use_tma_aligned_col_major_sf is None:
             use_tma_aligned_col_major_sf = x_sf.stride(0) == 1
@@ -186,17 +190,20 @@ def get_cast_input_and_config(
             x_sf = x_sf.T
             if config.use_packed_ue8m0:
                 assert x_sf.dtype == torch.int32
-                x_sf = x_sf.view(torch.uint8)
+                x_sf = x_sf.contiguous().view(torch.uint8)
+            else:
+                assert x_sf.dtype == torch.float32
         else:
             assert x_sf.stride(1) == 1
             assert x_sf.dtype == torch.float32
         return x_data, x_sf, config
 
-    assert x.dtype == torch.bfloat16
+    assert x.dtype in (torch.bfloat16, torch.float32)
+    sf_block = (1, 1) if sf_block is None else sf_block
     return x, None, CastInputConfig(
         torch_dtype=x.dtype,
         sf_block=sf_block,
-        with_sf=True,
+        with_sf=False,
         use_tma_aligned_col_major_sf=bool(use_tma_aligned_col_major_sf),
         use_packed_ue8m0=bool(use_packed_ue8m0),
     )
@@ -210,12 +217,18 @@ def get_cast_output_config(
     use_packed_ue8m0: bool = False,
     custom_clamp_min_value: Optional[float] = None,
 ) -> CastOutputConfig:
-    assert fmt in ("fp32", "float32", "e5m6")
+    assert fmt in ("fp32", "float32", "e5m6", "fp8", "fp4")
     mapping = {
         "fp32": torch.float32,
         "float32": torch.float32,
         "e5m6": torch.uint32,  # kernel outputs packed e5m6 as uint32
+        "fp8": torch.int8,
+        "fp4": torch.int8,
     }
+    if custom_clamp_min_value is None and fmt == "fp8":
+        custom_clamp_min_value = 1e-4
+    if custom_clamp_min_value is None and fmt == "fp4":
+        custom_clamp_min_value = 6.0 * 2 ** (-126)
     return CastOutputConfig(
         torch_dtype=mapping[fmt],
         sf_block=sf_block,
@@ -226,7 +239,8 @@ def get_cast_output_config(
     )
 
 
-def load_sf(tensor: torch.Tensor, m_idx: int, k_idx: int, config: BaseCastConfig):
+@T.macro
+def load_sf(tensor, m_idx: int, k_idx: int, config: BaseCastConfig):
     if config.use_packed_ue8m0:
         return tensor[k_idx // 4, m_idx * 4 + k_idx % 4]
     if config.use_tma_aligned_col_major_sf:
@@ -234,13 +248,21 @@ def load_sf(tensor: torch.Tensor, m_idx: int, k_idx: int, config: BaseCastConfig
     return tensor[m_idx, k_idx]
 
 
-def store_sf(tensor: torch.Tensor, sf, m_idx: int, k_idx: int, config: BaseCastConfig) -> None:
+@T.macro
+def store_sf(tensor, sf, m_idx: int, k_idx: int, config: BaseCastConfig) -> None:
     if config.use_packed_ue8m0:
         tensor[k_idx // 4, m_idx * 4 + k_idx % 4] = sf
     elif config.use_tma_aligned_col_major_sf:
         tensor[k_idx, m_idx] = sf
     else:
         tensor[m_idx, k_idx] = sf
+
+
+@T.macro
+def transform_sf(sf, config: BaseCastConfig):
+    if config.use_packed_ue8m0:
+        return T.reinterpret("float32", T.Cast("int32", sf) << 23)
+    return sf
 
 
 def sf_to_exponent_value(sf, config: BaseCastConfig) -> int:
