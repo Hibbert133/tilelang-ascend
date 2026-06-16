@@ -6,7 +6,7 @@ import tilelang
 import tilelang.language as T
 
 
-from .common import *
+from .my_common import *
 
 
 tilelang.cache.clear_cache()
@@ -30,7 +30,7 @@ def _derive_cast_layout(hidden: int, in_config: CastInputConfig, out_config: Cas
         and out_config.sf_block[1] % in_config.sf_block[1] == 0
     ), "Output block size must be multiple of input block size"
 
-    block_m = max(out_config.sf_block[0], 64)
+    block_m = max(out_config.sf_block[0], 128)
     block_k = max(out_config.sf_block[1], 512)
 
     assert block_m % out_config.sf_block[0] == 0
