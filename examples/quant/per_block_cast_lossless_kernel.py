@@ -95,6 +95,15 @@ def get_per_block_cast_lossless_kernel(
     vector_data_tile_m = block_m // VEC_NUM
     num_in_sf_per_vector_m = vector_data_tile_m // in_sf_block_m
     use_vid_local_sf = not in_config.use_packed_ue8m0 and not out_config.use_packed_ue8m0
+    use_local_max4_fast_path = (
+        use_vid_local_sf
+        and not in_config.use_tma_aligned_col_major_sf
+        and not out_config.use_tma_aligned_col_major_sf
+        and in_sf_block_m == 1
+        and out_sf_block_m == 1
+        and num_in_sf_per_out_sf_m == 1
+        and num_in_sf_per_out_sf_k == 4
+    )
     local_num_out_sf_per_block_m = vector_data_tile_m // out_sf_block_m
     local_num_out_sf_per_block = local_num_out_sf_per_block_m * num_out_sf_per_block_k
     if in_config.use_packed_ue8m0:
@@ -245,6 +254,48 @@ def get_per_block_cast_lossless_kernel(
         T.tile.cast(x_sf_exp_grouped_ub, x_sf_exp_i32_grouped_ub, mode="CAST_NONE", count=local_num_out_sf_per_block * num_in_sf_per_out_sf_aligned)
 
     @T.macro
+    def load_input_sf_exp_local_max4(x_sf_exp_i32_grouped_ub, out_sf_exp_ub, x_sf_load_ub, x_sf, sf_m, sf_k):
+        x_sf_bits_load_ub = T.alloc_ub(x_sf_load_local_shape, "int32")
+        T.copy(
+            x_sf[
+                sf_m : sf_m + num_in_sf_per_vector_m,
+                sf_k : sf_k + num_in_sf_per_block_k,
+            ],
+            x_sf_load_ub,
+        )
+        T.set_flag("mte2", "v", 0)
+        T.wait_flag("mte2", "v", 0)
+
+        T.reinterpretcast(x_sf_bits_load_ub, x_sf_load_ub, "int")
+        T.tile.bitwise_rshift(x_sf_bits_load_ub, x_sf_bits_load_ub, 23)
+
+        for group in T.serial(local_num_out_sf_per_block):
+            row = group // num_out_sf_per_block_k
+            out_sf_k = group - row * num_out_sf_per_block_k
+            sf_k_base = out_sf_k * 4
+
+            e0 = T.alloc_var("int32", init=x_sf_bits_load_ub[row, sf_k_base])
+            e1 = T.alloc_var("int32", init=x_sf_bits_load_ub[row, sf_k_base + 1])
+            e2 = T.alloc_var("int32", init=x_sf_bits_load_ub[row, sf_k_base + 2])
+            e3 = T.alloc_var("int32", init=x_sf_bits_load_ub[row, sf_k_base + 3])
+            max_exp = T.alloc_var("int32", init=e0)
+            if e1 > max_exp:
+                max_exp = e1
+            if e2 > max_exp:
+                max_exp = e2
+            if e3 > max_exp:
+                max_exp = e3
+
+            out_exp = T.alloc_var("int32", init=max_exp - 6)
+            if out_exp < 0:
+                out_exp = 0
+            out_sf_exp_ub[group] = out_exp
+            x_sf_exp_i32_grouped_ub[group, 0] = e0
+            x_sf_exp_i32_grouped_ub[group, 1] = e1
+            x_sf_exp_i32_grouped_ub[group, 2] = e2
+            x_sf_exp_i32_grouped_ub[group, 3] = e3
+
+    @T.macro
     def reduce_output_sf_exp(out_sf_exp_ub, x_sf_exp_grouped_ub, out_sf_exp_flat_ub):
         T.reduce_max(x_sf_exp_grouped_ub, out_sf_exp_flat_ub, dim=-1, clear=True, real_shape=[num_out_sf_per_block, num_in_sf_per_out_sf_aligned])
 
@@ -340,35 +391,6 @@ def get_per_block_cast_lossless_kernel(
                 out_sf[
                     out_sf_col_offset:out_sf_col_offset + num_out_sf_per_block_k,
                     out_sf_row_offset:out_sf_row_offset + local_num_out_sf_per_block_m,
-                ],
-            )
-
-    @T.macro
-    def apply_relative_sf_tiles(relative_sf_ub, x, out, row_offset, col_offset):
-        relative_sf_col_ub = T.alloc_ub((vector_data_tile_m, 1), "float32")
-        relative_sf_tile_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), "float32")
-        x_in_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), INPUT_DTYPE)
-        x_out_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), OUTPUT_DTYPE)
-        for sf_k in T.serial(num_in_sf_per_block_k):
-            for row in T.serial(vector_data_tile_m):
-                rel_idx = row * num_in_sf_per_block_k + sf_k
-                relative_sf_col_ub[row, 0] = relative_sf_ub[rel_idx]
-            T.tile.broadcast(relative_sf_tile_ub, relative_sf_col_ub, axis=1)
-            col_tile_offset = col_offset + sf_k * in_sf_block_k
-            T.copy(
-                x[
-                    row_offset : row_offset + vector_data_tile_m,
-                    col_tile_offset : col_tile_offset + in_sf_block_k,
-                ],
-                x_in_ub,
-            )
-            T.tile.cast(x_out_ub, x_in_ub, mode="CAST_NONE", count=vector_data_tile_m * in_sf_block_k)
-            T.tile.mul(x_out_ub, x_out_ub, relative_sf_tile_ub)
-            T.copy(
-                x_out_ub,
-                out[
-                    row_offset : row_offset + vector_data_tile_m,
-                    col_tile_offset : col_tile_offset + in_sf_block_k,
                 ],
             )
 
@@ -660,7 +682,29 @@ def get_per_block_cast_lossless_kernel(
                 out_sf_row_offset = pid_token * num_out_sf_per_block_m
                 out_sf_col_offset = pid_hidden * num_out_sf_per_block_k
 
-                if use_vid_local_sf:
+                if use_local_max4_fast_path:
+                    local_sf_row_offset = sf_row_offset + vid * num_in_sf_per_vector_m
+                    x_sf_load_ub = T.alloc_ub(x_sf_load_local_shape, "float32")
+                    x_sf_exp_i32_grouped_ub = T.alloc_ub((local_num_out_sf_per_block, num_in_sf_per_out_sf), "int32")
+                    out_sf_exp_ub = T.alloc_ub((local_num_out_sf_per_block,), "int32")
+
+                    load_input_sf_exp_local_max4(
+                        x_sf_exp_i32_grouped_ub,
+                        out_sf_exp_ub,
+                        x_sf_load_ub,
+                        x_sf,
+                        local_sf_row_offset,
+                        sf_col_offset,
+                    )
+                    apply_relative_sf_tiles_pair_local_exp_tile(
+                        x_sf_exp_i32_grouped_ub,
+                        out_sf_exp_ub,
+                        x,
+                        out,
+                        row_offset,
+                        col_offset,
+                    )
+                elif use_vid_local_sf:
                     local_sf_row_offset = sf_row_offset + vid * num_in_sf_per_vector_m
                     local_out_sf_row_offset = (out_sf_row_offset + vid * local_num_out_sf_per_block_m)
                     x_sf_load_ub = T.alloc_ub(x_sf_load_local_shape, "float32")
