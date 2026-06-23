@@ -32,6 +32,24 @@ def _derive_cast_layout(hidden: int, in_config: CastInputConfig, out_config: Cas
 
     block_m = max(out_config.sf_block[0], 128)
     block_k = max(out_config.sf_block[1], 512)
+    if (
+        not in_config.use_packed_ue8m0
+        and not out_config.use_packed_ue8m0
+        and not in_config.use_tma_aligned_col_major_sf
+        and not out_config.use_tma_aligned_col_major_sf
+        and in_config.sf_block == DEFAULT_IN_SF_BLOCK
+        and out_config.sf_block == DEFAULT_OUT_SF_BLOCK
+    ):
+        block_k_candidates = (256, 512)
+        block_k = min(
+            (
+                candidate
+                for candidate in block_k_candidates
+                if candidate % in_config.sf_block[1] == 0
+                and candidate % out_config.sf_block[1] == 0
+            ),
+            key=lambda candidate: align_up(hidden, candidate),
+        )
 
     assert block_m % out_config.sf_block[0] == 0
     assert block_k % out_config.sf_block[1] == 0
