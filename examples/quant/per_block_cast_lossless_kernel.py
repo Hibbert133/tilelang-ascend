@@ -48,7 +48,7 @@ def _derive_cast_layout(hidden: int, in_config: CastInputConfig, out_config: Cas
                 if candidate % in_config.sf_block[1] == 0
                 and candidate % out_config.sf_block[1] == 0
             ),
-            key=lambda candidate: align_up(hidden, candidate),
+            key=lambda candidate: (align_up(hidden, candidate), -candidate),
         )
 
     assert block_m % out_config.sf_block[0] == 0
@@ -273,8 +273,8 @@ def get_per_block_cast_lossless_kernel(
 
     @T.macro
     def load_input_sf_exp_local_max4(
-        x_sf_exp_i32_grouped_ub,
-        out_sf_exp_ub,
+        x_sf_exp_i32_row_ub,
+        out_sf_exp_row_ub,
         x_sf_load_ub,
         x_sf,
         sf_m,
@@ -311,11 +311,34 @@ def get_per_block_cast_lossless_kernel(
 
             out_exp = T.max(max_exp - 6, 0)
 
-            out_sf_exp_ub[group] = out_exp
-            x_sf_exp_i32_grouped_ub[group, 0] = e0
-            x_sf_exp_i32_grouped_ub[group, 1] = e1
-            x_sf_exp_i32_grouped_ub[group, 2] = e2
-            x_sf_exp_i32_grouped_ub[group, 3] = e3
+            out_sf_exp_row_ub[row, out_sf_k] = out_exp
+            x_sf_exp_i32_row_ub[row, sf_k_base + 0] = e0
+            x_sf_exp_i32_row_ub[row, sf_k_base + 1] = e1
+            x_sf_exp_i32_row_ub[row, sf_k_base + 2] = e2
+            x_sf_exp_i32_row_ub[row, sf_k_base + 3] = e3
+
+    @T.macro
+    def load_input_sf_exp_local_exp_only(
+        x_sf_exp_i32_row_ub,
+        x_sf_load_ub,
+        x_sf,
+        sf_m,
+        sf_k,
+    ):
+        x_sf_bits_load_ub = T.alloc_ub(x_sf_load_local_shape, "int32")
+
+        T.copy(
+            x_sf[
+                sf_m : sf_m + num_in_sf_per_vector_m,
+                sf_k : sf_k + num_in_sf_per_block_k,
+            ],
+            x_sf_load_ub,
+        )
+        T.set_flag("mte2", "v", 0)
+        T.wait_flag("mte2", "v", 0)
+
+        T.reinterpretcast(x_sf_bits_load_ub, x_sf_load_ub, "int")
+        T.tile.bitwise_rshift(x_sf_exp_i32_row_ub, x_sf_bits_load_ub, 23)
         T.pipe_barrier("all")
 
     @T.macro
@@ -449,9 +472,9 @@ def get_per_block_cast_lossless_kernel(
 
 
     @T.macro
-    def apply_relative_sf_tiles_pair_local_exp_tile(
-        x_sf_exp_i32_grouped_ub,
-        out_sf_exp_ub,
+    def apply_relative_sf_tiles_pair_local_exp_tile_row(
+        x_sf_exp_i32_row_ub,
+        out_sf_exp_row_ub,
         x,
         out,
         row_offset,
@@ -493,7 +516,7 @@ def get_per_block_cast_lossless_kernel(
             )
             T.tile.gather(
                 out_exp_col_ub,
-                out_sf_exp_ub,
+                out_sf_exp_row_ub,
                 out_group_row_offset_u32_ub,
                 0,
             )
@@ -505,25 +528,25 @@ def get_per_block_cast_lossless_kernel(
 
                 T.tile.arith_progression(
                     xsf_group_row_offset_i32_ub,
-                    (out_sf_k * num_in_sf_per_out_sf + reduce_j0) * 4,
-                    num_out_sf_per_block_k * num_in_sf_per_out_sf * 4,
+                    sf_k0 * 4,
+                    num_in_sf_per_block_k * 4,
                     vector_data_tile_m,
                 )
                 T.tile.gather(
                     input_exp0_ub,
-                    x_sf_exp_i32_grouped_ub,
+                    x_sf_exp_i32_row_ub,
                     xsf_group_row_offset_u32_ub,
                     0,
                 )
                 T.tile.arith_progression(
                     xsf_group_row_offset_i32_ub,
-                    (out_sf_k * num_in_sf_per_out_sf + reduce_j1) * 4,
-                    num_out_sf_per_block_k * num_in_sf_per_out_sf * 4,
+                    sf_k1 * 4,
+                    num_in_sf_per_block_k * 4,
                     vector_data_tile_m,
                 )
                 T.tile.gather(
                     input_exp1_ub,
-                    x_sf_exp_i32_grouped_ub,
+                    x_sf_exp_i32_row_ub,
                     xsf_group_row_offset_u32_ub,
                     0,
                 )
@@ -566,9 +589,8 @@ def get_per_block_cast_lossless_kernel(
                 sf_k = out_sf_k * num_in_sf_per_out_sf_k + reduce_j
 
                 for row in T.serial(vector_data_tile_m):
-                    group = row * num_out_sf_per_block_k + out_sf_k
-                    out_exp = out_sf_exp_ub[group] - 127
-                    relative_exp0_ub[row] = x_sf_exp_i32_grouped_ub[group, reduce_j] - out_exp
+                    out_exp = out_sf_exp_row_ub[row, out_sf_k] - 127
+                    relative_exp0_ub[row] = x_sf_exp_i32_row_ub[row, sf_k] - out_exp
 
                 T.tile.bitwise_lshift(relative_bits0_ub, relative_exp0_ub, 23)
                 T.reinterpretcast(relative_sf0_ub, relative_bits0_ub, "float")
@@ -585,6 +607,157 @@ def get_per_block_cast_lossless_kernel(
                 T.set_flag("v", "mte3", 1)
                 T.wait_flag("v", "mte3", 1)
                 T.copy(x_out0_ub, out[row_offset:row_offset + vector_data_tile_m, col_tile_offset:col_tile_offset + in_sf_block_k])
+
+    @T.macro
+    def apply_relative_sf_tiles_pair_local_exp_tile_fused_max4(
+        x_sf_exp_i32_row_ub,
+        x,
+        out,
+        row_offset,
+        col_offset,
+    ):
+        e0_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        e1_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        e2_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        e3_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        max01_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        max23_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        max_exp_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        out_exp_col_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+
+        xsf_row_offset_i32_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        xsf_row_offset_u32_ub = T.alloc_ub((vector_data_tile_m,), "uint32")
+
+        relative_exp0_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        relative_exp1_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        relative_exp2_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        relative_exp3_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        relative_bits0_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        relative_bits1_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        relative_bits2_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        relative_bits3_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+
+        relative_sf0_ub = T.alloc_ub((vector_data_tile_m, 1), "float32")
+        relative_sf1_ub = T.alloc_ub((vector_data_tile_m, 1), "float32")
+        relative_sf2_ub = T.alloc_ub((vector_data_tile_m, 1), "float32")
+        relative_sf3_ub = T.alloc_ub((vector_data_tile_m, 1), "float32")
+        relative_sf_tile0_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), "float32")
+        relative_sf_tile1_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), "float32")
+        relative_sf_tile2_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), "float32")
+        relative_sf_tile3_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), "float32")
+
+        x_in0_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), INPUT_DTYPE)
+        x_in1_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), INPUT_DTYPE)
+        x_out0_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), OUTPUT_DTYPE)
+        x_out1_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), OUTPUT_DTYPE)
+
+        tile_elem_count = vector_data_tile_m * in_sf_block_k
+        T.reinterpretcast(xsf_row_offset_u32_ub, xsf_row_offset_i32_ub, "uint32_t")
+
+        for out_sf_k in T.serial(num_out_sf_per_block_k):
+            sf_k_base = out_sf_k * num_in_sf_per_out_sf_k
+
+            T.tile.arith_progression(
+                xsf_row_offset_i32_ub,
+                (sf_k_base + 0) * 4,
+                num_in_sf_per_block_k * 4,
+                vector_data_tile_m,
+            )
+            T.tile.gather(e0_ub, x_sf_exp_i32_row_ub, xsf_row_offset_u32_ub, 0)
+            T.tile.arith_progression(
+                xsf_row_offset_i32_ub,
+                (sf_k_base + 1) * 4,
+                num_in_sf_per_block_k * 4,
+                vector_data_tile_m,
+            )
+            T.tile.gather(e1_ub, x_sf_exp_i32_row_ub, xsf_row_offset_u32_ub, 0)
+            T.tile.arith_progression(
+                xsf_row_offset_i32_ub,
+                (sf_k_base + 2) * 4,
+                num_in_sf_per_block_k * 4,
+                vector_data_tile_m,
+            )
+            T.tile.gather(e2_ub, x_sf_exp_i32_row_ub, xsf_row_offset_u32_ub, 0)
+            T.tile.arith_progression(
+                xsf_row_offset_i32_ub,
+                (sf_k_base + 3) * 4,
+                num_in_sf_per_block_k * 4,
+                vector_data_tile_m,
+            )
+            T.tile.gather(e3_ub, x_sf_exp_i32_row_ub, xsf_row_offset_u32_ub, 0)
+
+            T.pipe_barrier("all")
+            T.tile.max(max01_ub, e0_ub, e1_ub)
+            T.tile.max(max23_ub, e2_ub, e3_ub)
+            T.tile.max(max_exp_ub, max01_ub, max23_ub)
+            T.tile.add(out_exp_col_ub, max_exp_ub, -6)
+            T.tile.max(out_exp_col_ub, out_exp_col_ub, 0)
+
+            T.tile.sub(relative_exp0_ub, e0_ub, out_exp_col_ub)
+            T.tile.sub(relative_exp1_ub, e1_ub, out_exp_col_ub)
+            T.tile.add(relative_exp0_ub, relative_exp0_ub, 127)
+            T.tile.add(relative_exp1_ub, relative_exp1_ub, 127)
+
+            T.tile.bitwise_lshift(relative_bits0_ub, relative_exp0_ub, 23)
+            T.tile.bitwise_lshift(relative_bits1_ub, relative_exp1_ub, 23)
+
+            T.reinterpretcast(relative_sf0_ub, relative_bits0_ub, "float")
+            T.reinterpretcast(relative_sf1_ub, relative_bits1_ub, "float")
+
+            T.tile.broadcast(relative_sf_tile0_ub, relative_sf0_ub, axis=1)
+            T.tile.broadcast(relative_sf_tile1_ub, relative_sf1_ub, axis=1)
+
+            col_tile_offset0 = col_offset + (sf_k_base + 0) * in_sf_block_k
+            col_tile_offset1 = col_offset + (sf_k_base + 1) * in_sf_block_k
+            T.copy(x[row_offset:row_offset + vector_data_tile_m, col_tile_offset0:col_tile_offset0 + in_sf_block_k], x_in0_ub)
+            T.copy(x[row_offset:row_offset + vector_data_tile_m, col_tile_offset1:col_tile_offset1 + in_sf_block_k], x_in1_ub)
+            T.set_flag("mte2", "v", 1)
+            T.wait_flag("mte2", "v", 1)
+
+            T.tile.cast(x_out0_ub, x_in0_ub, mode="CAST_NONE", count=tile_elem_count)
+            T.tile.cast(x_out1_ub, x_in1_ub, mode="CAST_NONE", count=tile_elem_count)
+
+            T.tile.mul(x_out0_ub, x_out0_ub, relative_sf_tile0_ub)
+            T.tile.mul(x_out1_ub, x_out1_ub, relative_sf_tile1_ub)
+
+            T.set_flag("v", "mte3", 1)
+            T.wait_flag("v", "mte3", 1)
+            T.copy(x_out0_ub, out[row_offset:row_offset + vector_data_tile_m, col_tile_offset0:col_tile_offset0 + in_sf_block_k])
+            T.copy(x_out1_ub, out[row_offset:row_offset + vector_data_tile_m, col_tile_offset1:col_tile_offset1 + in_sf_block_k])
+
+            T.pipe_barrier("all")
+            T.tile.sub(relative_exp2_ub, e2_ub, out_exp_col_ub)
+            T.tile.sub(relative_exp3_ub, e3_ub, out_exp_col_ub)
+            T.tile.add(relative_exp2_ub, relative_exp2_ub, 127)
+            T.tile.add(relative_exp3_ub, relative_exp3_ub, 127)
+
+            T.tile.bitwise_lshift(relative_bits2_ub, relative_exp2_ub, 23)
+            T.tile.bitwise_lshift(relative_bits3_ub, relative_exp3_ub, 23)
+
+            T.reinterpretcast(relative_sf2_ub, relative_bits2_ub, "float")
+            T.reinterpretcast(relative_sf3_ub, relative_bits3_ub, "float")
+
+            T.tile.broadcast(relative_sf_tile2_ub, relative_sf2_ub, axis=1)
+            T.tile.broadcast(relative_sf_tile3_ub, relative_sf3_ub, axis=1)
+
+            col_tile_offset0 = col_offset + (sf_k_base + 2) * in_sf_block_k
+            col_tile_offset1 = col_offset + (sf_k_base + 3) * in_sf_block_k
+            T.copy(x[row_offset:row_offset + vector_data_tile_m, col_tile_offset0:col_tile_offset0 + in_sf_block_k], x_in0_ub)
+            T.copy(x[row_offset:row_offset + vector_data_tile_m, col_tile_offset1:col_tile_offset1 + in_sf_block_k], x_in1_ub)
+            T.set_flag("mte2", "v", 1)
+            T.wait_flag("mte2", "v", 1)
+
+            T.tile.cast(x_out0_ub, x_in0_ub, mode="CAST_NONE", count=tile_elem_count)
+            T.tile.cast(x_out1_ub, x_in1_ub, mode="CAST_NONE", count=tile_elem_count)
+
+            T.tile.mul(x_out0_ub, x_out0_ub, relative_sf_tile2_ub)
+            T.tile.mul(x_out1_ub, x_out1_ub, relative_sf_tile3_ub)
+
+            T.set_flag("v", "mte3", 1)
+            T.wait_flag("v", "mte3", 1)
+            T.copy(x_out0_ub, out[row_offset:row_offset + vector_data_tile_m, col_tile_offset0:col_tile_offset0 + in_sf_block_k])
+            T.copy(x_out1_ub, out[row_offset:row_offset + vector_data_tile_m, col_tile_offset1:col_tile_offset1 + in_sf_block_k])
+            T.pipe_barrier("all")
 
     @T.macro
     def apply_relative_sf_tiles_local_broadcast(x_sf_load_ub, out_sf_fp32_ub, x, out, row_offset, col_offset):
@@ -768,20 +941,17 @@ def get_per_block_cast_lossless_kernel(
                 if use_local_max4_fast_path:
                     local_sf_row_offset = sf_row_offset + vid * num_in_sf_per_vector_m
                     x_sf_load_ub = T.alloc_ub(x_sf_load_local_shape, "float32")
-                    x_sf_exp_i32_grouped_ub = T.alloc_ub((local_num_out_sf_per_block, num_in_sf_per_out_sf), "int32")
-                    out_sf_exp_ub = T.alloc_ub((local_num_out_sf_per_block,), "int32")
+                    x_sf_exp_i32_row_ub = T.alloc_ub((vector_data_tile_m, num_in_sf_per_block_k), "int32")
 
-                    load_input_sf_exp_local_max4(
-                        x_sf_exp_i32_grouped_ub,
-                        out_sf_exp_ub,
+                    load_input_sf_exp_local_exp_only(
+                        x_sf_exp_i32_row_ub,
                         x_sf_load_ub,
                         x_sf,
                         local_sf_row_offset,
                         sf_col_offset,
                     )
-                    apply_relative_sf_tiles_pair_local_exp_tile(
-                        x_sf_exp_i32_grouped_ub,
-                        out_sf_exp_ub,
+                    apply_relative_sf_tiles_pair_local_exp_tile_fused_max4(
+                        x_sf_exp_i32_row_ub,
                         x,
                         out,
                         row_offset,
@@ -806,7 +976,25 @@ def get_per_block_cast_lossless_kernel(
                     store_output_sf_local(out_sf, out_sf_fp32_ub, local_out_sf_row_offset, out_sf_col_offset)
 
                     if (in_sf_block_m == 1 and out_sf_block_m == 1 and num_in_sf_per_out_sf_k >= 2):
-                        apply_relative_sf_tiles_pair_local_exp_tile(x_sf_exp_i32_grouped_ub, out_sf_exp_ub, x, out, row_offset, col_offset)
+                        x_sf_exp_i32_row_ub = T.alloc_ub((vector_data_tile_m, num_in_sf_per_block_k), "int32")
+                        out_sf_exp_row_ub = T.alloc_ub((vector_data_tile_m, num_out_sf_per_block_k), "int32")
+                        for row in T.serial(vector_data_tile_m):
+                            for out_sf_k in T.serial(num_out_sf_per_block_k):
+                                group = row * num_out_sf_per_block_k + out_sf_k
+                                out_sf_exp_row_ub[row, out_sf_k] = out_sf_exp_ub[group]
+                            for sf_k in T.serial(num_in_sf_per_block_k):
+                                out_sf_k = sf_k // num_in_sf_per_out_sf_k
+                                reduce_j = sf_k - out_sf_k * num_in_sf_per_out_sf_k
+                                group = row * num_out_sf_per_block_k + out_sf_k
+                                x_sf_exp_i32_row_ub[row, sf_k] = x_sf_exp_i32_grouped_ub[group, reduce_j]
+                        apply_relative_sf_tiles_pair_local_exp_tile_row(
+                            x_sf_exp_i32_row_ub,
+                            out_sf_exp_row_ub,
+                            x,
+                            out,
+                            row_offset,
+                            col_offset,
+                        )
                     elif in_sf_block_m == 1 and out_sf_block_m == 1:
                         apply_relative_sf_tiles_local_broadcast(x_sf_load_ub, out_sf_fp32_ub, x, out, row_offset, col_offset)
                     elif num_in_sf_per_block_k % 2 == 0:
