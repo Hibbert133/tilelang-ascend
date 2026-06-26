@@ -1,0 +1,4 @@
+interface:
+  display_name: "TileLang Scalar Optimization"
+  short_description: "Optimize scalar-heavy TileLang Ascend kernels."
+  default_prompt: "Optimize scalar-heavy TileLang-Ascend kernel code using proven vectorization patterns."
