@@ -83,6 +83,7 @@ def get_per_block_cast_lossless_kernel(
     block_k: int,
     in_config: CastInputConfig,
     out_config: CastOutputConfig,
+    logical_hidden: int = -1,
     in_sf_block_m: int = DEFAULT_IN_SF_BLOCK[0],
     in_sf_block_k: int = DEFAULT_IN_SF_BLOCK[1],
     out_sf_block_m: int = DEFAULT_OUT_SF_BLOCK[0],
@@ -94,6 +95,9 @@ def get_per_block_cast_lossless_kernel(
     assert block_m % VEC_NUM == 0
     assert out_sf_block_m % in_sf_block_m == 0
     assert out_sf_block_k % in_sf_block_k == 0
+    if logical_hidden < 0:
+        logical_hidden = hidden
+    assert 0 < logical_hidden <= hidden
 
     num_tokens = T.symbolic("num_tokens")
 
@@ -108,6 +112,11 @@ def get_per_block_cast_lossless_kernel(
     num_out_sf_per_block = num_out_sf_per_block_m * num_out_sf_per_block_k
     num_in_sf_per_out_sf = num_in_sf_per_out_sf_m * num_in_sf_per_out_sf_k
     num_in_sf_per_out_sf_aligned = align_up(num_in_sf_per_out_sf, 8)
+    compact_sf_row_stride = align_up(num_in_sf_per_block_k, 8)
+    compact_sf_row_stride_bytes = compact_sf_row_stride * 4
+    num_in_sf_per_out_sf_bytes = num_in_sf_per_out_sf_k * 4
+    num_pipeline_pairs = num_out_sf_per_block_k * 2
+    num_initial_prefetch_stages = min(4, num_pipeline_pairs)
     x_sf_shape = get_sf_shape((num_tokens, hidden), in_config)
     out_sf_shape = get_sf_shape((num_tokens, hidden), out_config)
     vector_data_tile_m = block_m // VEC_NUM
@@ -122,6 +131,7 @@ def get_per_block_cast_lossless_kernel(
         and num_in_sf_per_out_sf_m == 1
         and num_in_sf_per_out_sf_k == 4
     )
+    use_compact_pattern_pipeline = use_local_max4_fast_path and 1 <= num_out_sf_per_block_k <= 2
     local_num_out_sf_per_block_m = vector_data_tile_m // out_sf_block_m
     local_num_out_sf_per_block = local_num_out_sf_per_block_m * num_out_sf_per_block_k
     if in_config.use_packed_ue8m0:
@@ -657,33 +667,13 @@ def get_per_block_cast_lossless_kernel(
         for out_sf_k in T.serial(num_out_sf_per_block_k):
             sf_k_base = out_sf_k * num_in_sf_per_out_sf_k
 
-            T.tile.arith_progression(
-                xsf_row_offset_i32_ub,
-                (sf_k_base + 0) * 4,
-                num_in_sf_per_block_k * 4,
-                vector_data_tile_m,
-            )
+            T.tile.arith_progression(xsf_row_offset_i32_ub, (sf_k_base + 0) * 4, num_in_sf_per_block_k * 4, vector_data_tile_m)
             T.tile.gather(e0_ub, x_sf_exp_i32_row_ub, xsf_row_offset_u32_ub, 0)
-            T.tile.arith_progression(
-                xsf_row_offset_i32_ub,
-                (sf_k_base + 1) * 4,
-                num_in_sf_per_block_k * 4,
-                vector_data_tile_m,
-            )
+            T.tile.arith_progression(xsf_row_offset_i32_ub, (sf_k_base + 1) * 4, num_in_sf_per_block_k * 4, vector_data_tile_m)
             T.tile.gather(e1_ub, x_sf_exp_i32_row_ub, xsf_row_offset_u32_ub, 0)
-            T.tile.arith_progression(
-                xsf_row_offset_i32_ub,
-                (sf_k_base + 2) * 4,
-                num_in_sf_per_block_k * 4,
-                vector_data_tile_m,
-            )
+            T.tile.arith_progression(xsf_row_offset_i32_ub, (sf_k_base + 2) * 4, num_in_sf_per_block_k * 4, vector_data_tile_m)
             T.tile.gather(e2_ub, x_sf_exp_i32_row_ub, xsf_row_offset_u32_ub, 0)
-            T.tile.arith_progression(
-                xsf_row_offset_i32_ub,
-                (sf_k_base + 3) * 4,
-                num_in_sf_per_block_k * 4,
-                vector_data_tile_m,
-            )
+            T.tile.arith_progression(xsf_row_offset_i32_ub, (sf_k_base + 3) * 4, num_in_sf_per_block_k * 4, vector_data_tile_m)
             T.tile.gather(e3_ub, x_sf_exp_i32_row_ub, xsf_row_offset_u32_ub, 0)
 
             T.pipe_barrier("all")
@@ -697,13 +687,10 @@ def get_per_block_cast_lossless_kernel(
             T.tile.sub(relative_exp1_ub, e1_ub, out_exp_col_ub)
             T.tile.add(relative_exp0_ub, relative_exp0_ub, 127)
             T.tile.add(relative_exp1_ub, relative_exp1_ub, 127)
-
             T.tile.bitwise_lshift(relative_bits0_ub, relative_exp0_ub, 23)
             T.tile.bitwise_lshift(relative_bits1_ub, relative_exp1_ub, 23)
-
             T.reinterpretcast(relative_sf0_ub, relative_bits0_ub, "float")
             T.reinterpretcast(relative_sf1_ub, relative_bits1_ub, "float")
-
             T.tile.broadcast(relative_sf_tile0_ub, relative_sf0_ub, axis=1)
             T.tile.broadcast(relative_sf_tile1_ub, relative_sf1_ub, axis=1)
 
@@ -713,13 +700,10 @@ def get_per_block_cast_lossless_kernel(
             T.copy(x[row_offset:row_offset + vector_data_tile_m, col_tile_offset1:col_tile_offset1 + in_sf_block_k], x_in1_ub)
             T.set_flag("mte2", "v", 1)
             T.wait_flag("mte2", "v", 1)
-
             T.tile.cast(x_out0_ub, x_in0_ub, mode="CAST_NONE", count=tile_elem_count)
             T.tile.cast(x_out1_ub, x_in1_ub, mode="CAST_NONE", count=tile_elem_count)
-
             T.tile.mul(x_out0_ub, x_out0_ub, relative_sf_tile0_ub)
             T.tile.mul(x_out1_ub, x_out1_ub, relative_sf_tile1_ub)
-
             T.set_flag("v", "mte3", 1)
             T.wait_flag("v", "mte3", 1)
             T.copy(x_out0_ub, out[row_offset:row_offset + vector_data_tile_m, col_tile_offset0:col_tile_offset0 + in_sf_block_k])
@@ -730,13 +714,10 @@ def get_per_block_cast_lossless_kernel(
             T.tile.sub(relative_exp3_ub, e3_ub, out_exp_col_ub)
             T.tile.add(relative_exp2_ub, relative_exp2_ub, 127)
             T.tile.add(relative_exp3_ub, relative_exp3_ub, 127)
-
             T.tile.bitwise_lshift(relative_bits2_ub, relative_exp2_ub, 23)
             T.tile.bitwise_lshift(relative_bits3_ub, relative_exp3_ub, 23)
-
             T.reinterpretcast(relative_sf2_ub, relative_bits2_ub, "float")
             T.reinterpretcast(relative_sf3_ub, relative_bits3_ub, "float")
-
             T.tile.broadcast(relative_sf_tile2_ub, relative_sf2_ub, axis=1)
             T.tile.broadcast(relative_sf_tile3_ub, relative_sf3_ub, axis=1)
 
@@ -746,18 +727,691 @@ def get_per_block_cast_lossless_kernel(
             T.copy(x[row_offset:row_offset + vector_data_tile_m, col_tile_offset1:col_tile_offset1 + in_sf_block_k], x_in1_ub)
             T.set_flag("mte2", "v", 1)
             T.wait_flag("mte2", "v", 1)
-
             T.tile.cast(x_out0_ub, x_in0_ub, mode="CAST_NONE", count=tile_elem_count)
             T.tile.cast(x_out1_ub, x_in1_ub, mode="CAST_NONE", count=tile_elem_count)
 
             T.tile.mul(x_out0_ub, x_out0_ub, relative_sf_tile2_ub)
             T.tile.mul(x_out1_ub, x_out1_ub, relative_sf_tile3_ub)
-
             T.set_flag("v", "mte3", 1)
             T.wait_flag("v", "mte3", 1)
             T.copy(x_out0_ub, out[row_offset:row_offset + vector_data_tile_m, col_tile_offset0:col_tile_offset0 + in_sf_block_k])
             T.copy(x_out1_ub, out[row_offset:row_offset + vector_data_tile_m, col_tile_offset1:col_tile_offset1 + in_sf_block_k])
             T.pipe_barrier("all")
+
+    @T.macro
+    def compute_two_pattern_max(
+        x_sf_exp_ub,
+        block_idx,
+        xsf_row_offset_i32_ub,
+        xsf_row_offset_u32_ub,
+        e0_ub,
+        e1_ub,
+        e2_ub,
+        e3_ub,
+        max01_ub,
+        max23_ub,
+        out_exp_ub,
+    ):
+        sf_k_base_bytes = block_idx * num_in_sf_per_out_sf_bytes
+
+        T.tile.arith_progression(xsf_row_offset_i32_ub, 0, compact_sf_row_stride_bytes, vector_data_tile_m)
+        T.pipe_barrier("v")
+        T.tile.gather(e0_ub, x_sf_exp_ub, xsf_row_offset_u32_ub, sf_k_base_bytes)
+        T.tile.gather(e1_ub, x_sf_exp_ub, xsf_row_offset_u32_ub, sf_k_base_bytes + 4)
+        T.tile.gather(e2_ub, x_sf_exp_ub, xsf_row_offset_u32_ub, sf_k_base_bytes + 8)
+        T.tile.gather(e3_ub, x_sf_exp_ub, xsf_row_offset_u32_ub, sf_k_base_bytes + 12)
+        T.pipe_barrier("v")
+        T.tile.max(max01_ub, e0_ub, e1_ub)
+        T.tile.max(max23_ub, e2_ub, e3_ub)
+        T.pipe_barrier("v")
+        T.tile.max(out_exp_ub, max01_ub, max23_ub)
+        T.pipe_barrier("v")
+        T.tile.add(out_exp_ub, out_exp_ub, -6)
+        T.pipe_barrier("v")
+        T.tile.max(out_exp_ub, out_exp_ub, 0)
+        T.pipe_barrier("v")
+
+    @T.macro
+    def load_two_pair_input(
+        x,
+        x_in0_ub,
+        x_in1_ub,
+        row_offset,
+        col_offset,
+        input_event,
+    ):
+        T.wait_flag("v", "mte2", input_event)
+        T.copy(
+            x[row_offset : row_offset + vector_data_tile_m, col_offset : col_offset + in_sf_block_k],
+            x_in0_ub,
+        )
+        T.copy(
+            x[
+                row_offset : row_offset + vector_data_tile_m,
+                col_offset + in_sf_block_k : col_offset + 2 * in_sf_block_k,
+            ],
+            x_in1_ub,
+        )
+        T.set_flag("mte2", "v", input_event)
+
+    @T.macro
+    def compute_two_pair_values(
+        e0_ub,
+        e1_ub,
+        out_exp_ub,
+        relative_exp0_ub,
+        relative_exp1_ub,
+        relative_bits0_ub,
+        relative_bits1_ub,
+        relative_sf0_view_ub,
+        relative_sf1_view_ub,
+        relative_sf_tile0_ub,
+        relative_sf_tile1_ub,
+        x_in0_ub,
+        x_in1_ub,
+        x_out0_ub,
+        x_out1_ub,
+        input_event,
+        output_event,
+    ):
+        tile_elem_count = vector_data_tile_m * in_sf_block_k
+        T.tile.sub(relative_exp0_ub, e0_ub, out_exp_ub)
+        T.tile.sub(relative_exp1_ub, e1_ub, out_exp_ub)
+        T.pipe_barrier("v")
+        T.tile.add(relative_exp0_ub, relative_exp0_ub, 127)
+        T.tile.add(relative_exp1_ub, relative_exp1_ub, 127)
+        T.pipe_barrier("v")
+        T.tile.bitwise_lshift(relative_bits0_ub, relative_exp0_ub, 23)
+        T.tile.bitwise_lshift(relative_bits1_ub, relative_exp1_ub, 23)
+        T.pipe_barrier("v")
+        T.tile.broadcast(relative_sf_tile0_ub, relative_sf0_view_ub, axis=1)
+        T.tile.broadcast(relative_sf_tile1_ub, relative_sf1_view_ub, axis=1)
+
+        T.wait_flag("mte2", "v", input_event)
+        T.wait_flag("mte3", "v", output_event)
+        T.tile.cast(x_out0_ub, x_in0_ub, mode="CAST_NONE", count=tile_elem_count)
+        T.tile.cast(x_out1_ub, x_in1_ub, mode="CAST_NONE", count=tile_elem_count)
+        T.pipe_barrier("v")
+        T.set_flag("v", "mte2", input_event)
+        T.tile.mul(x_out0_ub, x_out0_ub, relative_sf_tile0_ub)
+        T.tile.mul(x_out1_ub, x_out1_ub, relative_sf_tile1_ub)
+        T.set_flag("v", "mte3", output_event)
+
+    @T.macro
+    def store_two_pair_output(
+        out,
+        x_out0_ub,
+        x_out1_ub,
+        row_offset,
+        col_offset,
+        output_event,
+    ):
+        T.wait_flag("v", "mte3", output_event)
+        T.copy(
+            x_out0_ub,
+            out[row_offset : row_offset + vector_data_tile_m, col_offset : col_offset + in_sf_block_k],
+        )
+        T.copy(
+            x_out1_ub,
+            out[
+                row_offset : row_offset + vector_data_tile_m,
+                col_offset + in_sf_block_k : col_offset + 2 * in_sf_block_k,
+            ],
+        )
+        T.set_flag("mte3", "v", output_event)
+
+    @T.macro
+    def apply_relative_sf_tiles_compact_pattern_pipeline(
+        x_sf,
+        x,
+        out,
+        sf_m,
+        sf_k,
+        row_offset,
+        col_offset,
+    ):
+        x_sf_load_ub = T.alloc_ub((vector_data_tile_m, compact_sf_row_stride), "float32")
+        x_sf_bits_ub = T.alloc_ub((vector_data_tile_m, compact_sf_row_stride), "int32")
+        x_sf_exp_ub = T.alloc_ub((vector_data_tile_m, compact_sf_row_stride), "int32")
+        T.reinterpretcast(x_sf_bits_ub, x_sf_load_ub, "int")
+
+        # Two input/output slots form a pair ring: slot 0 serves pairs 0/2 and
+        # slot 1 serves pairs 1/3.  Each pair stays as two independent 32-col
+        # chunks; widening to 64-col stores made MTE3 much longer.
+        x_in00_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), INPUT_DTYPE)
+        x_in01_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), INPUT_DTYPE)
+        x_in10_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), INPUT_DTYPE)
+        x_in11_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), INPUT_DTYPE)
+        x_out00_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), OUTPUT_DTYPE)
+        x_out01_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), OUTPUT_DTYPE)
+        x_out10_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), OUTPUT_DTYPE)
+        x_out11_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), OUTPUT_DTYPE)
+
+        xsf_row_offset_i32_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        xsf_row_offset_u32_ub = T.alloc_ub((vector_data_tile_m,), "uint32")
+        e0_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        e1_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        e2_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        e3_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        max01_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        max23_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        out_exp_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        relative_exp0_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        relative_exp1_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        relative_bits0_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        relative_bits1_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        relative_sf0_view_ub = T.alloc_ub((vector_data_tile_m, 1), "float32")
+        relative_sf1_view_ub = T.alloc_ub((vector_data_tile_m, 1), "float32")
+        relative_sf_tile0_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), "float32")
+        relative_sf_tile1_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), "float32")
+
+        T.reinterpretcast(xsf_row_offset_u32_ub, xsf_row_offset_i32_ub, "uint32_t")
+        T.reinterpretcast(relative_sf0_view_ub, relative_bits0_ub, "float")
+        T.reinterpretcast(relative_sf1_view_ub, relative_bits1_ub, "float")
+
+        T.copy(x_sf[sf_m : sf_m + num_in_sf_per_vector_m, sf_k : sf_k + num_in_sf_per_block_k], x_sf_load_ub)
+        T.set_flag("mte2", "v", 4)
+
+        # Seed the ring after the padded SF copy, whose implementation may use
+        # event 0 while clearing the 32-byte-aligned UB rows.
+        for slot in T.unroll(2):
+            T.set_flag("v", "mte2", slot)
+            T.set_flag("mte3", "v", slot)
+
+        load_two_pair_input(x, x_in00_ub, x_in01_ub, row_offset, col_offset, 0)
+        load_two_pair_input(x, x_in10_ub, x_in11_ub, row_offset, col_offset + 2 * in_sf_block_k, 1)
+
+        T.wait_flag("mte2", "v", 4)
+        T.tile.bitwise_rshift(x_sf_exp_ub, x_sf_bits_ub, 23)
+        T.pipe_barrier("v")
+
+        compute_two_pattern_max(
+            x_sf_exp_ub, 0,
+            xsf_row_offset_i32_ub, xsf_row_offset_u32_ub,
+            e0_ub, e1_ub, e2_ub, e3_ub, max01_ub, max23_ub, out_exp_ub,
+        )
+
+        compute_two_pair_values(
+            e0_ub, e1_ub, out_exp_ub,
+            relative_exp0_ub, relative_exp1_ub, relative_bits0_ub, relative_bits1_ub,
+            relative_sf0_view_ub, relative_sf1_view_ub, relative_sf_tile0_ub, relative_sf_tile1_ub,
+            x_in00_ub, x_in01_ub, x_out00_ub, x_out01_ub, 0, 0,
+        )
+
+        if num_out_sf_per_block_k == 2:
+            load_two_pair_input(x, x_in00_ub, x_in01_ub, row_offset, col_offset + out_sf_block_k, 0)
+        store_two_pair_output(out, x_out00_ub, x_out01_ub, row_offset, col_offset, 0)
+
+        compute_two_pair_values(
+            e2_ub, e3_ub, out_exp_ub,
+            relative_exp0_ub, relative_exp1_ub, relative_bits0_ub, relative_bits1_ub,
+            relative_sf0_view_ub, relative_sf1_view_ub, relative_sf_tile0_ub, relative_sf_tile1_ub,
+            x_in10_ub, x_in11_ub, x_out10_ub, x_out11_ub, 1, 1,
+        )
+
+        if num_out_sf_per_block_k == 2:
+            load_two_pair_input(
+                x, x_in10_ub, x_in11_ub, row_offset,
+                col_offset + out_sf_block_k + 2 * in_sf_block_k, 1,
+            )
+        store_two_pair_output(out, x_out10_ub, x_out11_ub, row_offset, col_offset + 2 * in_sf_block_k, 1)
+
+        if num_out_sf_per_block_k == 2:
+            # Pattern 1 max work overlaps the pair 0/1 MTE3 stores and pair 2/3 prefetches.
+            compute_two_pattern_max(
+                x_sf_exp_ub, 1,
+                xsf_row_offset_i32_ub, xsf_row_offset_u32_ub,
+                e0_ub, e1_ub, e2_ub, e3_ub, max01_ub, max23_ub, out_exp_ub,
+            )
+
+            compute_two_pair_values(
+                e0_ub, e1_ub, out_exp_ub,
+                relative_exp0_ub, relative_exp1_ub, relative_bits0_ub, relative_bits1_ub,
+                relative_sf0_view_ub, relative_sf1_view_ub, relative_sf_tile0_ub, relative_sf_tile1_ub,
+                x_in00_ub, x_in01_ub, x_out00_ub, x_out01_ub, 0, 0,
+            )
+            store_two_pair_output(out, x_out00_ub, x_out01_ub, row_offset, col_offset + out_sf_block_k, 0)
+
+            compute_two_pair_values(
+                e2_ub, e3_ub, out_exp_ub,
+                relative_exp0_ub, relative_exp1_ub, relative_bits0_ub, relative_bits1_ub,
+                relative_sf0_view_ub, relative_sf1_view_ub, relative_sf_tile0_ub, relative_sf_tile1_ub,
+                x_in10_ub, x_in11_ub, x_out10_ub, x_out11_ub, 1, 1,
+            )
+            store_two_pair_output(
+                out, x_out10_ub, x_out11_ub, row_offset,
+                col_offset + out_sf_block_k + 2 * in_sf_block_k, 1,
+            )
+        # Destroy the ring events left by the final slot use. Every seeded or
+        # recycled event must be consumed before the vector kernel exits.
+        T.wait_flag("v", "mte2", 0)
+        T.wait_flag("v", "mte2", 1)
+        T.wait_flag("mte3", "v", 0)
+        T.wait_flag("mte3", "v", 1)
+
+    @T.macro
+    def apply_relative_sf_tiles_compact_pattern_tail64(
+        x_sf,
+        x,
+        out,
+        sf_m,
+        sf_k,
+        row_offset,
+        col_offset,
+    ):
+        tail_x_sf_load_ub = T.alloc_ub((vector_data_tile_m, compact_sf_row_stride), "float32")
+        tail_x_sf_bits_ub = T.alloc_ub((vector_data_tile_m, compact_sf_row_stride), "int32")
+        tail_x_sf_exp_ub = T.alloc_ub((vector_data_tile_m, compact_sf_row_stride), "int32")
+        T.reinterpretcast(tail_x_sf_bits_ub, tail_x_sf_load_ub, "int")
+
+        tail_x_in00_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), INPUT_DTYPE)
+        tail_x_in01_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), INPUT_DTYPE)
+        tail_x_out00_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), OUTPUT_DTYPE)
+        tail_x_out01_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), OUTPUT_DTYPE)
+
+        tail_xsf_row_offset_i32_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        tail_xsf_row_offset_u32_ub = T.alloc_ub((vector_data_tile_m,), "uint32")
+        tail_e0_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        tail_e1_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        tail_e2_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        tail_e3_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        tail_max01_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        tail_max23_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        tail_out_exp_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        tail_relative_exp0_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        tail_relative_exp1_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        tail_relative_bits0_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        tail_relative_bits1_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        tail_relative_sf0_view_ub = T.alloc_ub((vector_data_tile_m, 1), "float32")
+        tail_relative_sf1_view_ub = T.alloc_ub((vector_data_tile_m, 1), "float32")
+        tail_relative_sf_tile0_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), "float32")
+        tail_relative_sf_tile1_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), "float32")
+
+        T.reinterpretcast(tail_xsf_row_offset_u32_ub, tail_xsf_row_offset_i32_ub, "uint32_t")
+        T.reinterpretcast(tail_relative_sf0_view_ub, tail_relative_bits0_ub, "float")
+        T.reinterpretcast(tail_relative_sf1_view_ub, tail_relative_bits1_ub, "float")
+
+        T.copy(x_sf[sf_m : sf_m + num_in_sf_per_vector_m, sf_k : sf_k + num_in_sf_per_block_k], tail_x_sf_load_ub)
+        T.set_flag("mte2", "v", 4)
+
+        T.set_flag("v", "mte2", 0)
+        T.set_flag("mte3", "v", 0)
+        load_two_pair_input(x, tail_x_in00_ub, tail_x_in01_ub, row_offset, col_offset, 0)
+
+        T.wait_flag("mte2", "v", 4)
+        T.tile.bitwise_rshift(tail_x_sf_exp_ub, tail_x_sf_bits_ub, 23)
+        T.pipe_barrier("v")
+
+        compute_two_pattern_max(
+            tail_x_sf_exp_ub, 0,
+            tail_xsf_row_offset_i32_ub, tail_xsf_row_offset_u32_ub,
+            tail_e0_ub, tail_e1_ub, tail_e2_ub, tail_e3_ub, tail_max01_ub, tail_max23_ub, tail_out_exp_ub,
+        )
+        compute_two_pair_values(
+            tail_e0_ub, tail_e1_ub, tail_out_exp_ub,
+            tail_relative_exp0_ub, tail_relative_exp1_ub, tail_relative_bits0_ub, tail_relative_bits1_ub,
+            tail_relative_sf0_view_ub, tail_relative_sf1_view_ub,
+            tail_relative_sf_tile0_ub, tail_relative_sf_tile1_ub,
+            tail_x_in00_ub, tail_x_in01_ub, tail_x_out00_ub, tail_x_out01_ub, 0, 0,
+        )
+        store_two_pair_output(out, tail_x_out00_ub, tail_x_out01_ub, row_offset, col_offset, 0)
+        T.wait_flag("v", "mte2", 0)
+        T.wait_flag("mte3", "v", 0)
+
+    @T.macro
+    def apply_relative_sf_tiles_block_pipeline_max4(
+        x_sf,
+        x,
+        out,
+        sf_m,
+        sf_k,
+        row_offset,
+        col_offset,
+    ):
+        tile_elem_count = vector_data_tile_m * in_sf_block_k
+
+        x_sf_load_ub = T.alloc_ub(
+            (vector_data_tile_m, num_in_sf_per_block_k),
+            "float32",
+        )
+        x_sf_bits_ub = T.alloc_ub(
+            (vector_data_tile_m, num_in_sf_per_block_k),
+            "int32",
+        )
+        x_sf_exp_ub = T.alloc_ub(
+            (vector_data_tile_m, num_in_sf_per_block_k),
+            "int32",
+        )
+
+        # Keep every PTO operand as an independent fixed-shape buffer. The
+        # 0624 parser cannot evaluate variable-based ranges into local UB.
+        x_in0_slot0_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), INPUT_DTYPE)
+        x_in1_slot0_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), INPUT_DTYPE)
+        x_in0_slot1_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), INPUT_DTYPE)
+        x_in1_slot1_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), INPUT_DTYPE)
+        x_in0_slot2_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), INPUT_DTYPE)
+        x_in1_slot2_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), INPUT_DTYPE)
+        x_in0_slot3_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), INPUT_DTYPE)
+        x_in1_slot3_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), INPUT_DTYPE)
+
+        x_out00_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), OUTPUT_DTYPE)
+        x_out01_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), OUTPUT_DTYPE)
+        x_out10_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), OUTPUT_DTYPE)
+        x_out11_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), OUTPUT_DTYPE)
+        x_out20_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), OUTPUT_DTYPE)
+        x_out21_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), OUTPUT_DTYPE)
+        x_out30_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), OUTPUT_DTYPE)
+        x_out31_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), OUTPUT_DTYPE)
+
+        xsf_row_offset_i32_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        xsf_row_offset_u32_ub = T.alloc_ub((vector_data_tile_m,), "uint32")
+        e0_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        e1_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        e2_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        e3_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        max01_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        max23_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        max_exp_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        out_exp_col_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+
+        relative_exp0_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        relative_exp1_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        relative_bits0_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        relative_bits1_ub = T.alloc_ub((vector_data_tile_m,), "int32")
+        relative_sf0_view_ub = T.alloc_ub((vector_data_tile_m, 1), "float32")
+        relative_sf1_view_ub = T.alloc_ub((vector_data_tile_m, 1), "float32")
+        relative_sf_tile0_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), "float32")
+        relative_sf_tile1_ub = T.alloc_ub((vector_data_tile_m, in_sf_block_k), "float32")
+
+        T.reinterpretcast(x_sf_bits_ub, x_sf_load_ub, "int")
+        T.reinterpretcast(xsf_row_offset_u32_ub, xsf_row_offset_i32_ub, "uint32_t")
+        T.reinterpretcast(relative_sf0_view_ub, relative_bits0_ub, "float")
+        T.reinterpretcast(relative_sf1_view_ub, relative_bits1_ub, "float")
+
+        # Seed all four MTE2 input slots. The first four stages are prefetched
+        # before vector work starts, so they do not depend on slot reuse.
+        for input_slot in T.unroll(4):
+            T.set_flag("v", "mte2", input_slot)
+
+        # Prologue: overlap the full SF load with the first data pair load.
+        T.copy(
+            x_sf[
+                sf_m : sf_m + num_in_sf_per_vector_m,
+                sf_k : sf_k + num_in_sf_per_block_k,
+            ],
+            x_sf_load_ub,
+        )
+        T.set_flag("mte2", "v", 4)
+
+        # Queue four stages up front. MTE2 continues loading later slots while
+        # V decodes SF and starts consuming the earlier slots.
+        for preload_stage in T.unroll(num_initial_prefetch_stages):
+            preload_slot = preload_stage
+            preload_block_idx = preload_stage // 2
+            preload_pair_idx = preload_stage % 2
+            preload_line0_idx = preload_pair_idx * 2
+            preload_line1_idx = preload_line0_idx + 1
+            preload_col_base = col_offset + preload_block_idx * out_sf_block_k
+
+            T.wait_flag("v", "mte2", preload_slot)
+            if preload_slot == 0:
+                T.copy(x[row_offset : row_offset + vector_data_tile_m, preload_col_base + preload_line0_idx * in_sf_block_k : preload_col_base + (preload_line0_idx + 1) * in_sf_block_k], x_in0_slot0_ub)
+                T.copy(x[row_offset : row_offset + vector_data_tile_m, preload_col_base + preload_line1_idx * in_sf_block_k : preload_col_base + (preload_line1_idx + 1) * in_sf_block_k], x_in1_slot0_ub)
+            elif preload_slot == 1:
+                T.copy(x[row_offset : row_offset + vector_data_tile_m, preload_col_base + preload_line0_idx * in_sf_block_k : preload_col_base + (preload_line0_idx + 1) * in_sf_block_k], x_in0_slot1_ub)
+                T.copy(x[row_offset : row_offset + vector_data_tile_m, preload_col_base + preload_line1_idx * in_sf_block_k : preload_col_base + (preload_line1_idx + 1) * in_sf_block_k], x_in1_slot1_ub)
+            elif preload_slot == 2:
+                T.copy(x[row_offset : row_offset + vector_data_tile_m, preload_col_base + preload_line0_idx * in_sf_block_k : preload_col_base + (preload_line0_idx + 1) * in_sf_block_k], x_in0_slot2_ub)
+                T.copy(x[row_offset : row_offset + vector_data_tile_m, preload_col_base + preload_line1_idx * in_sf_block_k : preload_col_base + (preload_line1_idx + 1) * in_sf_block_k], x_in1_slot2_ub)
+            else:
+                T.copy(x[row_offset : row_offset + vector_data_tile_m, preload_col_base + preload_line0_idx * in_sf_block_k : preload_col_base + (preload_line0_idx + 1) * in_sf_block_k], x_in0_slot3_ub)
+                T.copy(x[row_offset : row_offset + vector_data_tile_m, preload_col_base + preload_line1_idx * in_sf_block_k : preload_col_base + (preload_line1_idx + 1) * in_sf_block_k], x_in1_slot3_ub)
+            T.set_flag("mte2", "v", preload_slot)
+
+        T.wait_flag("mte2", "v", 4)
+        T.tile.bitwise_rshift(x_sf_exp_ub, x_sf_bits_ub, 23)
+        T.pipe_barrier("v")
+
+        for block_idx in T.unroll(num_out_sf_per_block_k):
+            sf_k_base = block_idx * num_in_sf_per_out_sf_k
+
+            T.tile.arith_progression(
+                xsf_row_offset_i32_ub,
+                (sf_k_base + 0) * 4,
+                num_in_sf_per_block_k * 4,
+                vector_data_tile_m,
+            )
+            T.tile.gather(e0_ub, x_sf_exp_ub, xsf_row_offset_u32_ub, 0)
+            T.tile.arith_progression(
+                xsf_row_offset_i32_ub,
+                (sf_k_base + 1) * 4,
+                num_in_sf_per_block_k * 4,
+                vector_data_tile_m,
+            )
+            T.tile.gather(e1_ub, x_sf_exp_ub, xsf_row_offset_u32_ub, 0)
+            T.tile.arith_progression(
+                xsf_row_offset_i32_ub,
+                (sf_k_base + 2) * 4,
+                num_in_sf_per_block_k * 4,
+                vector_data_tile_m,
+            )
+            T.tile.gather(e2_ub, x_sf_exp_ub, xsf_row_offset_u32_ub, 0)
+            T.tile.arith_progression(
+                xsf_row_offset_i32_ub,
+                (sf_k_base + 3) * 4,
+                num_in_sf_per_block_k * 4,
+                vector_data_tile_m,
+            )
+            T.tile.gather(e3_ub, x_sf_exp_ub, xsf_row_offset_u32_ub, 0)
+
+            T.pipe_barrier("v")
+            T.tile.max(max01_ub, e0_ub, e1_ub)
+            T.tile.max(max23_ub, e2_ub, e3_ub)
+            T.tile.max(max_exp_ub, max01_ub, max23_ub)
+            T.tile.add(out_exp_col_ub, max_exp_ub, -6)
+            T.tile.max(out_exp_col_ub, out_exp_col_ub, 0)
+
+            for pair_idx in T.unroll(2):
+                stage = block_idx * 2 + pair_idx
+                input_slot = stage % 4
+                output_slot = stage % 4
+                line0_idx = pair_idx * 2
+                line1_idx = line0_idx + 1
+
+                # Four-stage look-ahead: only stages beyond the initial four
+                # reuse an input slot. Queue the future load before V work so
+                # it can overlap the current stage and the previous MTE3.
+                if stage + 4 < num_pipeline_pairs:
+                    future_stage = stage + 4
+                    future_block_idx = future_stage // 2
+                    future_pair_idx = future_stage % 2
+                    future_line0_idx = future_pair_idx * 2
+                    future_line1_idx = future_line0_idx + 1
+                    future_col_base = col_offset + future_block_idx * out_sf_block_k
+
+                    T.wait_flag("v", "mte2", input_slot)
+                    if input_slot == 0:
+                        T.copy(x[row_offset : row_offset + vector_data_tile_m, future_col_base + future_line0_idx * in_sf_block_k : future_col_base + (future_line0_idx + 1) * in_sf_block_k], x_in0_slot0_ub)
+                        T.copy(x[row_offset : row_offset + vector_data_tile_m, future_col_base + future_line1_idx * in_sf_block_k : future_col_base + (future_line1_idx + 1) * in_sf_block_k], x_in1_slot0_ub)
+                    elif input_slot == 1:
+                        T.copy(x[row_offset : row_offset + vector_data_tile_m, future_col_base + future_line0_idx * in_sf_block_k : future_col_base + (future_line0_idx + 1) * in_sf_block_k], x_in0_slot1_ub)
+                        T.copy(x[row_offset : row_offset + vector_data_tile_m, future_col_base + future_line1_idx * in_sf_block_k : future_col_base + (future_line1_idx + 1) * in_sf_block_k], x_in1_slot1_ub)
+                    elif input_slot == 2:
+                        T.copy(x[row_offset : row_offset + vector_data_tile_m, future_col_base + future_line0_idx * in_sf_block_k : future_col_base + (future_line0_idx + 1) * in_sf_block_k], x_in0_slot2_ub)
+                        T.copy(x[row_offset : row_offset + vector_data_tile_m, future_col_base + future_line1_idx * in_sf_block_k : future_col_base + (future_line1_idx + 1) * in_sf_block_k], x_in1_slot2_ub)
+                    else:
+                        T.copy(x[row_offset : row_offset + vector_data_tile_m, future_col_base + future_line0_idx * in_sf_block_k : future_col_base + (future_line0_idx + 1) * in_sf_block_k], x_in0_slot3_ub)
+                        T.copy(x[row_offset : row_offset + vector_data_tile_m, future_col_base + future_line1_idx * in_sf_block_k : future_col_base + (future_line1_idx + 1) * in_sf_block_k], x_in1_slot3_ub)
+                    T.set_flag("mte2", "v", input_slot)
+                if stage >= 4:
+                    T.wait_flag("mte3", "v", output_slot)
+
+                if pair_idx == 0:
+                    T.tile.sub(relative_exp0_ub, e0_ub, out_exp_col_ub)
+                    T.tile.sub(relative_exp1_ub, e1_ub, out_exp_col_ub)
+                else:
+                    T.tile.sub(relative_exp0_ub, e2_ub, out_exp_col_ub)
+                    T.tile.sub(relative_exp1_ub, e3_ub, out_exp_col_ub)
+
+                T.tile.add(relative_exp0_ub, relative_exp0_ub, 127)
+                T.tile.add(relative_exp1_ub, relative_exp1_ub, 127)
+                T.tile.bitwise_lshift(relative_bits0_ub, relative_exp0_ub, 23)
+                T.tile.bitwise_lshift(relative_bits1_ub, relative_exp1_ub, 23)
+                T.pipe_barrier("v")
+                T.tile.broadcast(relative_sf_tile0_ub, relative_sf0_view_ub, axis=1)
+                T.tile.broadcast(relative_sf_tile1_ub, relative_sf1_view_ub, axis=1)
+
+                # Delay the consumer wait until the first input-buffer read so
+                # relative-SF work can hide the current MTE2 transfer.
+                T.wait_flag("mte2", "v", input_slot)
+
+                if output_slot == 0:
+                    if input_slot == 0:
+                        T.tile.cast(x_out00_ub, x_in0_slot0_ub, mode="CAST_NONE", count=tile_elem_count)
+                        T.tile.cast(x_out01_ub, x_in1_slot0_ub, mode="CAST_NONE", count=tile_elem_count)
+                    elif input_slot == 1:
+                        T.tile.cast(x_out00_ub, x_in0_slot1_ub, mode="CAST_NONE", count=tile_elem_count)
+                        T.tile.cast(x_out01_ub, x_in1_slot1_ub, mode="CAST_NONE", count=tile_elem_count)
+                    elif input_slot == 2:
+                        T.tile.cast(x_out00_ub, x_in0_slot2_ub, mode="CAST_NONE", count=tile_elem_count)
+                        T.tile.cast(x_out01_ub, x_in1_slot2_ub, mode="CAST_NONE", count=tile_elem_count)
+                    else:
+                        T.tile.cast(x_out00_ub, x_in0_slot3_ub, mode="CAST_NONE", count=tile_elem_count)
+                        T.tile.cast(x_out01_ub, x_in1_slot3_ub, mode="CAST_NONE", count=tile_elem_count)
+                    if stage + 4 < num_pipeline_pairs:
+                        T.set_flag("v", "mte2", input_slot)
+                    T.tile.mul(x_out00_ub, x_out00_ub, relative_sf_tile0_ub)
+                    T.tile.mul(x_out01_ub, x_out01_ub, relative_sf_tile1_ub)
+                elif output_slot == 1:
+                    if input_slot == 0:
+                        T.tile.cast(x_out10_ub, x_in0_slot0_ub, mode="CAST_NONE", count=tile_elem_count)
+                        T.tile.cast(x_out11_ub, x_in1_slot0_ub, mode="CAST_NONE", count=tile_elem_count)
+                    elif input_slot == 1:
+                        T.tile.cast(x_out10_ub, x_in0_slot1_ub, mode="CAST_NONE", count=tile_elem_count)
+                        T.tile.cast(x_out11_ub, x_in1_slot1_ub, mode="CAST_NONE", count=tile_elem_count)
+                    elif input_slot == 2:
+                        T.tile.cast(x_out10_ub, x_in0_slot2_ub, mode="CAST_NONE", count=tile_elem_count)
+                        T.tile.cast(x_out11_ub, x_in1_slot2_ub, mode="CAST_NONE", count=tile_elem_count)
+                    else:
+                        T.tile.cast(x_out10_ub, x_in0_slot3_ub, mode="CAST_NONE", count=tile_elem_count)
+                        T.tile.cast(x_out11_ub, x_in1_slot3_ub, mode="CAST_NONE", count=tile_elem_count)
+                    if stage + 4 < num_pipeline_pairs:
+                        T.set_flag("v", "mte2", input_slot)
+                    T.tile.mul(x_out10_ub, x_out10_ub, relative_sf_tile0_ub)
+                    T.tile.mul(x_out11_ub, x_out11_ub, relative_sf_tile1_ub)
+                elif output_slot == 2:
+                    if input_slot == 0:
+                        T.tile.cast(x_out20_ub, x_in0_slot0_ub, mode="CAST_NONE", count=tile_elem_count)
+                        T.tile.cast(x_out21_ub, x_in1_slot0_ub, mode="CAST_NONE", count=tile_elem_count)
+                    elif input_slot == 1:
+                        T.tile.cast(x_out20_ub, x_in0_slot1_ub, mode="CAST_NONE", count=tile_elem_count)
+                        T.tile.cast(x_out21_ub, x_in1_slot1_ub, mode="CAST_NONE", count=tile_elem_count)
+                    elif input_slot == 2:
+                        T.tile.cast(x_out20_ub, x_in0_slot2_ub, mode="CAST_NONE", count=tile_elem_count)
+                        T.tile.cast(x_out21_ub, x_in1_slot2_ub, mode="CAST_NONE", count=tile_elem_count)
+                    else:
+                        T.tile.cast(x_out20_ub, x_in0_slot3_ub, mode="CAST_NONE", count=tile_elem_count)
+                        T.tile.cast(x_out21_ub, x_in1_slot3_ub, mode="CAST_NONE", count=tile_elem_count)
+                    if stage + 4 < num_pipeline_pairs:
+                        T.set_flag("v", "mte2", input_slot)
+                    T.tile.mul(x_out20_ub, x_out20_ub, relative_sf_tile0_ub)
+                    T.tile.mul(x_out21_ub, x_out21_ub, relative_sf_tile1_ub)
+                else:
+                    if input_slot == 0:
+                        T.tile.cast(x_out30_ub, x_in0_slot0_ub, mode="CAST_NONE", count=tile_elem_count)
+                        T.tile.cast(x_out31_ub, x_in1_slot0_ub, mode="CAST_NONE", count=tile_elem_count)
+                    elif input_slot == 1:
+                        T.tile.cast(x_out30_ub, x_in0_slot1_ub, mode="CAST_NONE", count=tile_elem_count)
+                        T.tile.cast(x_out31_ub, x_in1_slot1_ub, mode="CAST_NONE", count=tile_elem_count)
+                    elif input_slot == 2:
+                        T.tile.cast(x_out30_ub, x_in0_slot2_ub, mode="CAST_NONE", count=tile_elem_count)
+                        T.tile.cast(x_out31_ub, x_in1_slot2_ub, mode="CAST_NONE", count=tile_elem_count)
+                    else:
+                        T.tile.cast(x_out30_ub, x_in0_slot3_ub, mode="CAST_NONE", count=tile_elem_count)
+                        T.tile.cast(x_out31_ub, x_in1_slot3_ub, mode="CAST_NONE", count=tile_elem_count)
+                    if stage + 4 < num_pipeline_pairs:
+                        T.set_flag("v", "mte2", input_slot)
+                    T.tile.mul(x_out30_ub, x_out30_ub, relative_sf_tile0_ub)
+                    T.tile.mul(x_out31_ub, x_out31_ub, relative_sf_tile1_ub)
+
+                T.set_flag("v", "mte3", output_slot)
+                T.wait_flag("v", "mte3", output_slot)
+
+                current_col_base = col_offset + block_idx * out_sf_block_k
+                if output_slot == 0:
+                    T.copy(
+                        x_out00_ub,
+                        out[
+                            row_offset : row_offset + vector_data_tile_m,
+                            current_col_base + line0_idx * in_sf_block_k :
+                            current_col_base + (line0_idx + 1) * in_sf_block_k,
+                        ],
+                    )
+                    T.copy(
+                        x_out01_ub,
+                        out[
+                            row_offset : row_offset + vector_data_tile_m,
+                            current_col_base + line1_idx * in_sf_block_k :
+                            current_col_base + (line1_idx + 1) * in_sf_block_k,
+                        ],
+                    )
+                elif output_slot == 1:
+                    T.copy(
+                        x_out10_ub,
+                        out[
+                            row_offset : row_offset + vector_data_tile_m,
+                            current_col_base + line0_idx * in_sf_block_k :
+                            current_col_base + (line0_idx + 1) * in_sf_block_k,
+                        ],
+                    )
+                    T.copy(
+                        x_out11_ub,
+                        out[
+                            row_offset : row_offset + vector_data_tile_m,
+                            current_col_base + line1_idx * in_sf_block_k :
+                            current_col_base + (line1_idx + 1) * in_sf_block_k,
+                        ],
+                    )
+                elif output_slot == 2:
+                    T.copy(
+                        x_out20_ub,
+                        out[
+                            row_offset : row_offset + vector_data_tile_m,
+                            current_col_base + line0_idx * in_sf_block_k :
+                            current_col_base + (line0_idx + 1) * in_sf_block_k,
+                        ],
+                    )
+                    T.copy(
+                        x_out21_ub,
+                        out[
+                            row_offset : row_offset + vector_data_tile_m,
+                            current_col_base + line1_idx * in_sf_block_k :
+                            current_col_base + (line1_idx + 1) * in_sf_block_k,
+                        ],
+                    )
+                else:
+                    T.copy(
+                        x_out30_ub,
+                        out[
+                            row_offset : row_offset + vector_data_tile_m,
+                            current_col_base + line0_idx * in_sf_block_k :
+                            current_col_base + (line0_idx + 1) * in_sf_block_k,
+                        ],
+                    )
+                    T.copy(
+                        x_out31_ub,
+                        out[
+                            row_offset : row_offset + vector_data_tile_m,
+                            current_col_base + line1_idx * in_sf_block_k :
+                            current_col_base + (line1_idx + 1) * in_sf_block_k,
+                        ],
+                    )
+                if stage + 4 < num_pipeline_pairs:
+                    T.set_flag("mte3", "v", output_slot)
+
+        # No per-slot drain is needed: reuse events are emitted only when a
+        # later stage consumes them. Flush the final GM writes locally.
+        T.pipe_barrier("mte3")
 
     @T.macro
     def apply_relative_sf_tiles_local_broadcast(x_sf_load_ub, out_sf_fp32_ub, x, out, row_offset, col_offset):
@@ -938,22 +1592,47 @@ def get_per_block_cast_lossless_kernel(
                 out_sf_row_offset = pid_token * num_out_sf_per_block_m
                 out_sf_col_offset = pid_hidden * num_out_sf_per_block_k
 
-                if use_local_max4_fast_path:
+                if use_compact_pattern_pipeline:
                     local_sf_row_offset = sf_row_offset + vid * num_in_sf_per_vector_m
-                    x_sf_load_ub = T.alloc_ub(x_sf_load_local_shape, "float32")
-                    x_sf_exp_i32_row_ub = T.alloc_ub((vector_data_tile_m, num_in_sf_per_block_k), "int32")
-
-                    load_input_sf_exp_local_exp_only(
-                        x_sf_exp_i32_row_ub,
-                        x_sf_load_ub,
+                    if col_offset + block_k <= logical_hidden:
+                        apply_relative_sf_tiles_compact_pattern_pipeline(
+                            x_sf,
+                            x,
+                            out,
+                            local_sf_row_offset,
+                            sf_col_offset,
+                            row_offset,
+                            col_offset,
+                        )
+                    elif col_offset < logical_hidden:
+                        if logical_hidden - col_offset <= 2 * in_sf_block_k:
+                            apply_relative_sf_tiles_compact_pattern_tail64(
+                                x_sf,
+                                x,
+                                out,
+                                local_sf_row_offset,
+                                sf_col_offset,
+                                row_offset,
+                                col_offset,
+                            )
+                        else:
+                            apply_relative_sf_tiles_compact_pattern_pipeline(
+                                x_sf,
+                                x,
+                                out,
+                                local_sf_row_offset,
+                                sf_col_offset,
+                                row_offset,
+                                col_offset,
+                            )
+                elif use_local_max4_fast_path:
+                    local_sf_row_offset = sf_row_offset + vid * num_in_sf_per_vector_m
+                    apply_relative_sf_tiles_block_pipeline_max4(
                         x_sf,
-                        local_sf_row_offset,
-                        sf_col_offset,
-                    )
-                    apply_relative_sf_tiles_pair_local_exp_tile_fused_max4(
-                        x_sf_exp_i32_row_ub,
                         x,
                         out,
+                        local_sf_row_offset,
+                        sf_col_offset,
                         row_offset,
                         col_offset,
                     )
