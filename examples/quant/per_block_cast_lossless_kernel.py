@@ -6,44 +6,7 @@ import tilelang.language as T
 from .my_common import *
 tilelang.cache.clear_cache()
 
-<<<<<<< HEAD
-=======
-def _pad_2d_on_cpu_then_to_device(x: torch.Tensor, target_shape: tuple[int, int], fill_value=0) -> torch.Tensor:
-    """Pad a 2D tensor on CPU, then move it back to the original device.
 
-    This avoids launching PyTorch NPU ops such as torch.zeros / slice copy
-    before the TileLang kernel when running under msprof op simulator.
-    """
-    assert x.dim() == 2, f'Only 2D tensors are supported, got shape={tuple(x.shape)}'
-    target_device = x.device
-    src_m, src_k = x.shape
-    dst_m, dst_k = target_shape
-    if src_m == dst_m and src_k == dst_k:
-        if x.is_contiguous():
-            return x
-        return x.detach().to('cpu').contiguous().to(target_device)
-    x_cpu = x.detach().to('cpu').contiguous()
-    out_cpu = torch.full((dst_m, dst_k), fill_value, dtype=x_cpu.dtype, device='cpu')
-    copy_m = min(src_m, dst_m)
-    copy_k = min(src_k, dst_k)
-    out_cpu[:copy_m, :copy_k] = x_cpu[:copy_m, :copy_k]
-    return out_cpu.to(target_device).contiguous()
-
-def _crop_2d_on_cpu_then_to_device(x: torch.Tensor, target_shape: tuple[int, int]) -> torch.Tensor:
-    """Crop a 2D tensor on CPU, then move it back to the original device.
-
-    This avoids NPU slicing / TensorMove in Python wrapper epilogue under
-    msprof op simulator.
-    """
-    assert x.dim() == 2, f'Only 2D tensors are supported, got shape={tuple(x.shape)}'
-    target_device = x.device
-    dst_m, dst_k = target_shape
-    if x.shape[0] == dst_m and x.shape[1] == dst_k:
-        if x.is_contiguous():
-            return x
-        return x.detach().to('cpu').contiguous().to(target_device)
-    x_cpu = x.detach().to('cpu').contiguous()
-    return x_cpu[:dst_m, :dst_k].contiguous().to(target_device)
 DEFAULT_IN_SF_BLOCK = (1, 32)
 DEFAULT_OUT_SF_BLOCK = (1, 128)
 VEC_NUM = 2
@@ -2352,19 +2315,23 @@ def per_block_cast_lossless(
     block_k = layout['block_k']
     padded_tokens = align_up(num_tokens, block_m)
     padded_hidden = align_up(hidden, block_k)
-<<<<<<< HEAD
-
-    if padded_tokens != num_tokens or padded_hidden != hidden:
-        x_padded = torch.zeros((padded_tokens, padded_hidden), dtype=x_data.dtype, device=x_data.device)
-        x_padded[:num_tokens, :hidden] = x_data
+    if num_tokens == padded_tokens and hidden == padded_hidden:
+        x_padded = x_data if x_data.is_contiguous() else x_data.contiguous()
     else:
-        x_padded = x_data
+        x_padded = torch.empty((padded_tokens, padded_hidden), dtype=x_data.dtype, device=x_data.device)
+        x_padded.zero_()
+        x_padded[:num_tokens, :hidden].copy_(x_data)
 
-=======
-    x_padded = _pad_2d_on_cpu_then_to_device(x_data, (padded_tokens, padded_hidden), fill_value=0)
->>>>>>> 010c7f3 (per_block_cast_lossless_kernel v0705 cleaned_version)
     x_sf_shape = get_sf_shape((padded_tokens, padded_hidden), in_config)
-    x_sf_padded = _pad_2d_on_cpu_then_to_device(x_sf, x_sf_shape, fill_value=0)
+    if tuple(x_sf.shape) == tuple(x_sf_shape):
+        x_sf_padded = x_sf if x_sf.is_contiguous() else x_sf.contiguous()
+    else:
+        x_sf_padded = torch.empty(x_sf_shape, dtype=x_sf.dtype, device=x_sf.device)
+        x_sf_padded.zero_()
+        copy_m = min(x_sf.shape[0], x_sf_shape[0])
+        copy_k = min(x_sf.shape[1], x_sf_shape[1])
+        x_sf_padded[:copy_m, :copy_k].copy_(x_sf[:copy_m, :copy_k])
+
     out = torch.empty((padded_tokens, padded_hidden), dtype=out_config.torch_dtype, device=x_data.device)
     out_sf = alloc_scaling_factors((padded_tokens, padded_hidden), out_config, x_data.device)
     if use_v1_kernel:
@@ -2394,11 +2361,9 @@ def per_block_cast_lossless(
     if print_kernel_source:
         print(kernel.get_kernel_source())
     out, out_sf = kernel(x_padded, kernel_input_sf, out, out_sf)
-<<<<<<< HEAD
-
-    out = out[:num_tokens, :hidden]
-=======
-    out = _crop_2d_on_cpu_then_to_device(out, (num_tokens, hidden))
->>>>>>> 010c7f3 (per_block_cast_lossless_kernel v0705 cleaned_version)
+    if out.shape[0] != num_tokens or out.shape[1] != hidden:
+        out = out[:num_tokens, :hidden].contiguous()
+    elif not out.is_contiguous():
+        out = out.contiguous()
     out_sf = cast_epilogue(out_sf, num_tokens, hidden, out_config)
     return (out, out_sf)
