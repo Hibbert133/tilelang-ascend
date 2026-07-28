@@ -19,7 +19,7 @@ tilelang.cache.clear_cache()
 pass_configs = {tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: True}
 
 
-@tilelang.jit(out_idx=[-5, -4], pass_configs=pass_configs)
+@tilelang.jit(out_idx=[-5, -4], pass_configs=pass_configs, target="pto")
 def get_per_channel_cast_fused_kernel(hidden: int, with_expand: bool, in_config: CastInputConfig, out_config: CastOutputConfig):
     TILE_M = 128
     BLOCK_M = 64
@@ -34,6 +34,7 @@ def get_per_channel_cast_fused_kernel(hidden: int, with_expand: bool, in_config:
     round_sf = out_config.round_sf
     in_dtype = in_config.dtype
     out_dtype = out_config.dtype
+    compute_dtype = "float32"
     in_sf_dtype = in_config.sf_dtype
     out_sf_dtype = out_config.sf_dtype
     FP8_MAX_VALUE = 448.0
@@ -69,16 +70,18 @@ def get_per_channel_cast_fused_kernel(hidden: int, with_expand: bool, in_config:
             x_ub = T.alloc_ub((TILE_M, COMPUTE_K), in_dtype)
             x_block_ub = T.alloc_ub((BLOCK_M, COMPUTE_K), in_dtype)
             tail_x_block_ub = T.alloc_ub((TAIL_BLOCK_M, COMPUTE_K), in_dtype)
-            x_fp32_ub = T.alloc_ub((BLOCK_M, COMPUTE_K), out_dtype)
-            scale_tile_ub = T.alloc_ub((BLOCK_M, COMPUTE_K), out_dtype)
-            tail_x_fp32_ub = T.alloc_ub((TAIL_BLOCK_M, COMPUTE_K), out_dtype)
-            tail_scale_tile_ub = T.alloc_ub((TAIL_BLOCK_M, COMPUTE_K), out_dtype)
-            amax_ub = T.alloc_ub((1, COMPUTE_K), out_dtype)
-            local_amax_ub = T.alloc_ub((1, COMPUTE_K), out_dtype)
-            tail_local_amax_ub = T.alloc_ub((1, COMPUTE_K), out_dtype)
-            sf_ub = T.alloc_ub((1, COMPUTE_K), out_dtype)
-            reciprocal_ub = T.alloc_ub((1, COMPUTE_K), out_dtype)
-            newton_ub = T.alloc_ub((1, COMPUTE_K), out_dtype)
+            x_fp32_ub = T.alloc_ub((BLOCK_M, COMPUTE_K), compute_dtype)
+            x_fp8_ub = T.alloc_ub((BLOCK_M, COMPUTE_K), out_dtype)
+            scale_tile_ub = T.alloc_ub((BLOCK_M, COMPUTE_K), compute_dtype)
+            tail_x_fp32_ub = T.alloc_ub((TAIL_BLOCK_M, COMPUTE_K), compute_dtype)
+            tail_x_fp8_ub = T.alloc_ub((TAIL_BLOCK_M, COMPUTE_K), out_dtype)
+            tail_scale_tile_ub = T.alloc_ub((TAIL_BLOCK_M, COMPUTE_K), compute_dtype)
+            amax_ub = T.alloc_ub((1, COMPUTE_K), compute_dtype)
+            local_amax_ub = T.alloc_ub((1, COMPUTE_K), compute_dtype)
+            tail_local_amax_ub = T.alloc_ub((1, COMPUTE_K), compute_dtype)
+            sf_ub = T.alloc_ub((1, COMPUTE_K), compute_dtype)
+            reciprocal_ub = T.alloc_ub((1, COMPUTE_K), compute_dtype)
+            newton_ub = T.alloc_ub((1, COMPUTE_K), compute_dtype)
             sf_chunk_ub = T.alloc_ub((TILE_M, SF_CHUNK), in_sf_dtype)
             sf_invs_ub = T.alloc_ub((LOCAL_K_GROUP, TILE_M, 1), in_sf_dtype)
             sf_pair_ub = T.alloc_ub((TILE_M * 2,), in_sf_dtype)
@@ -246,9 +249,11 @@ def get_per_channel_cast_fused_kernel(hidden: int, with_expand: bool, in_config:
                     T.tile.mul(x_fp32_ub, x_fp32_ub, scale_tile_ub)
 
                     if vid < K_GROUP:
+                        T.pipe_barrier("v")
+                        T.tile.cast(x_fp8_ub, x_fp32_ub, mode="CAST_NONE", count=BLOCK_M * COMPUTE_K)
                         T.set_flag("v", "mte3", 0)
                         T.wait_flag("v", "mte3", 0)
-                        T.copy(x_fp32_ub, out[tile_row_offset : tile_row_offset + BLOCK_M, sub_col_offset : sub_col_offset + COMPUTE_K])
+                        T.copy(x_fp8_ub, out[tile_row_offset : tile_row_offset + BLOCK_M, sub_col_offset : sub_col_offset + COMPUTE_K])
                         T.set_flag("mte3", "v", 0)
                 if HAS_M_TAIL:
                     tail_row_offset = row_offset + FULL_M_TILES * BLOCK_M
@@ -264,9 +269,11 @@ def get_per_channel_cast_fused_kernel(hidden: int, with_expand: bool, in_config:
                     T.pipe_barrier("v")
                     T.tile.mul(tail_x_fp32_ub, tail_x_fp32_ub, tail_scale_tile_ub)
                     if vid < K_GROUP:
+                        T.pipe_barrier("v")
+                        T.tile.cast(tail_x_fp8_ub, tail_x_fp32_ub, mode="CAST_NONE", count=M_TAIL * COMPUTE_K)
                         T.set_flag("v", "mte3", 1)
                         T.wait_flag("v", "mte3", 1)
-                        T.copy(tail_x_fp32_ub, out[tail_row_offset : tail_row_offset + M_TAIL, sub_col_offset : sub_col_offset + COMPUTE_K])
+                        T.copy(tail_x_fp8_ub, out[tail_row_offset : tail_row_offset + M_TAIL, sub_col_offset : sub_col_offset + COMPUTE_K])
                         T.set_flag("mte3", "v", 1)
                         T.wait_flag("mte3", "v", 1)
                 if vid < K_GROUP:
@@ -302,7 +309,7 @@ def per_channel_cast_fused(
         assert x_sf_invs.size(0) == num_tokens
         assert x_sf_invs.size(1) * 128 == hidden
 
-    out_config = get_cast_output_config("fp32", (num_per_tokens, 1), round_sf=round_sf)
+    out_config = get_cast_output_config("fp8", (num_per_tokens, 1), round_sf=round_sf)
     kernel = get_per_channel_cast_fused_kernel(hidden, with_expand=(pos_to_token is not None), in_config=in_config, out_config=out_config)
 
     if int(os.getenv("TK_PRINT_KERNEL_SOURCE", 0)):
@@ -320,15 +327,10 @@ def per_channel_cast_fused(
         _tok_dim_ref = torch.zeros((num_tokens_out,), dtype=torch.int32, device=x_data.device)
         out, out_sf = kernel(x_data, _x_sf_invs, _pos_to_token, _tok_dim_ref)
     else:
-        out = torch.empty((0, hidden), dtype=torch.float32, device=x_data.device)
+        out = torch.empty((0, hidden), dtype=torch.float8_e4m3fn, device=x_data.device)
         out_sf = torch.empty((0, hidden), dtype=torch.float32, device=x_data.device)
 
     return out, out_sf
-
-
-def _cast_fp32_to_fp8_cpu(x: torch.Tensor) -> torch.Tensor:
-    assert x.dtype == torch.float32
-    return x.detach().cpu().to(torch.float8_e4m3fn)
 
 
 def generate_hidden_sizes(align: int = 64) -> list[int]:
@@ -555,23 +557,20 @@ def _check_case(params: dict) -> None:
 
     ref_out, ref_sf = func_ref()
 
-    assert out.dtype == torch.float32
+    assert out.dtype == torch.float8_e4m3fn
     assert out_sf.dtype == torch.float32
     assert out.shape == ref_out.shape
     assert out_sf.shape == ref_sf.shape
     out_cpu = out.cpu()
-    ref_out_cpu = ref_out.cpu()
     out_sf_cpu = out_sf.cpu()
     ref_sf_cpu = ref_sf.cpu()
 
-    torch.testing.assert_close(out_cpu, ref_out_cpu, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(out_sf_cpu, ref_sf_cpu, rtol=1e-3, atol=1e-3)
 
-    out_fp8 = _cast_fp32_to_fp8_cpu(out)
-    ref_out_fp8 = _cast_fp32_to_fp8_cpu(ref_out)
-    fp8_mismatches = torch.count_nonzero(out_fp8.float() != ref_out_fp8.float()).item()
-    fp8_mismatch_rate = fp8_mismatches / out_fp8.numel()
-    assert fp8_mismatch_rate <= 1e-3, f"FP8 bucket mismatch rate {fp8_mismatch_rate:.6e} ({fp8_mismatches}/{out_fp8.numel()}) exceeds 1e-3"
+    ref_out_fp8 = ref_out.to(torch.float8_e4m3fn)
+    fp8_mismatches = torch.count_nonzero(out_cpu.float() != ref_out_fp8.float()).item()
+    fp8_mismatch_rate = fp8_mismatches / out_cpu.numel()
+    assert fp8_mismatch_rate <= 1e-3, f"FP8 bucket mismatch rate {fp8_mismatch_rate:.6e} ({fp8_mismatches}/{out_cpu.numel()}) exceeds 1e-3"
 
 
 def _make_param_id(params: dict) -> str:

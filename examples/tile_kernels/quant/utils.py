@@ -27,6 +27,10 @@ class BaseCastConfig:
 
     @property
     def dtype(self) -> str:
+        if self.torch_dtype == torch.float8_e4m3fn:
+            return "e4m3_float8"
+        if self.torch_dtype == torch.float8_e5m2:
+            return "e5m2_float8"
         return str(self.torch_dtype).replace("torch.", "")
 
     @property
@@ -60,6 +64,8 @@ class CastOutputConfig(BaseCastConfig):
             return torch.finfo(torch.bfloat16).tiny
         if self.dtype == "int8":
             return 6.0 * 2 ** (-126)
+        if self.dtype in ("e4m3_float8", "e5m2_float8"):
+            return torch.finfo(self.torch_dtype).tiny
         raise ValueError(f"Unsupported dtype {self.dtype}")
 
 
@@ -186,7 +192,7 @@ def get_cast_output_config(
         "fp32": torch.float32,
         "float32": torch.float32,
         "e5m6": torch.uint32,
-        "fp8": torch.int8,
+        "fp8": torch.float8_e4m3fn,
         "fp4": torch.int8,
     }
     if custom_clamp_min_value is None and fmt == "fp8":
